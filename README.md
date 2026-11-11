@@ -1,63 +1,76 @@
 # jobcarbon
 
-Carbon footprint of a Slurm job, and the waste worth fixing, from nothing but
-its job identifier.
+`jobcarbon` estimates the carbon footprint of a Slurm job from its job
+identifier and reports two common sources of waste: reserved memory that the
+job never uses, and memory concentrated in a single NUMA domain of a
+multi-domain node. For each finding it states the corrective change and how to
+verify it.
 
-`jobcarbon` reads the job's record from Slurm (`sacct`), computes its carbon
-footprint in gCO2e (IPCC 2021, GWP100) and flags two kinds of waste:
-
-- **memory reserved but never used** (peak use under half of the reservation);
-- **memory concentrated in one NUMA domain** while the job uses more cores than
-  one domain has. This is checked live, by running `numastat` inside the job's
-  own allocation while it runs.
-
-For each flag it prints the change to make and how to check that it worked.
-It is the tool of Section IV.D of the paper; the method it applies is:
-
-1. **Recognise** — many threads on a multi-domain node, speed that stops growing
-   past one domain's cores, and `numastat -p` showing most of the memory in one
-   domain. (Slurm's CPU efficiency can still look close to 100 %: a core
-   waiting for memory counts as busy.)
-2. **Change** — launch under `numactl --interleave=all` (no code change), or
-   initialise the data in parallel with the threads that use it.
-3. **Check** — identical output (checksum or diff), memory spread over the
-   domains, runtime and energy per run measured again the same way.
+The footprint follows a life cycle assessment of one job: the operational
+emissions of the allocated node (processors, memory, rest of the node, data
+centre overhead) and the share of the node's manufacturing allocated to the
+time the job holds it. Results are expressed in gCO2e under IPCC 2021 GWP100.
 
 ## Requirements
 
-Python 3.8 or newer, standard library only. On a cluster: `sacct`, and for the
-placement check `srun` and `numastat` (package `numactl`). Nothing to install.
+- Python 3.8 or later; standard library only.
+- On a Slurm cluster: `sacct`; for the NUMA check, also `srun` and `numastat`
+  (package `numactl`).
+- Without a cluster, the tool runs on a saved `sacct` record or on values
+  supplied on the command line.
+
+No installation is needed. In the commands below, `jobcarbon.py` stands for the
+path to the script, e.g. `~/jobcarbon/jobcarbon.py`.
 
 ## Usage
 
-```bash
-# On the cluster: footprint and flags of a finished job (whole-job estimate)
-python3 jobcarbon.py 16068563 -M aion
-
-# Measured per-run footprint, from a powercap recording written by measure.sh
-python3 jobcarbon.py 16229728 -M aion --rapl results/16229728/rapl.tsv
-
-# While a job is running: check where its memory sits
-python3 jobcarbon.py <jobid> -M aion --probe-numa XSBench
-
-# Without a cluster: from a saved sacct record, or from values directly
-python3 jobcarbon.py --sacct-file examples/<jobid>.sacct
-python3 jobcarbon.py --runtime 259.67 --energy-j 93135
-
-# Machine-readable output
-python3 jobcarbon.py --runtime 259.67 --energy-j 93135 --json
+```
+python3 jobcarbon.py [JOBID] [options]
 ```
 
-To save a record for offline use, run on the cluster:
+| Option | Meaning |
+|---|---|
+| `JOBID` | Slurm job identifier |
+| `-M, --cluster NAME` | Slurm cluster to query, for multi-cluster sites |
+| `--rapl FILE` | Powercap recording of the job; enables measured per-run energy (format below) |
+| `--runtime S`, `--energy-j J` | Duration (s) and measured processor energy (J) of one run, without Slurm |
+| `--probe-numa PROCESS` | While the job runs, read the NUMA placement of `PROCESS` inside its allocation |
+| `--sacct-file FILE` | Read a saved `sacct` record instead of querying Slurm |
+| `--config FILE` | JSON file overriding the default hardware and site factors |
+| `--json` | Machine-readable output |
+
+## Examples
+
+Footprint and findings for a finished job:
 
 ```bash
-sacct -j <jobid> -P -o JobID,JobName,Partition,NodeList,AllocNodes,AllocCPUS,ElapsedRaw,TotalCPU,ReqMem,MaxRSS,State > <jobid>.sacct
+python3 jobcarbon.py <jobid>
 ```
 
-## What it prints
+Check the memory placement of a running job (replace `myprog` by the name of
+the executable):
 
-Reproducing the baseline figure of the paper (one run of XSBench as
-distributed, Section III.E: 18.9 gCO2e), with no cluster needed:
+```bash
+python3 jobcarbon.py <jobid> --probe-numa myprog
+```
+
+Measured per-run footprint, from a powercap recording:
+
+```bash
+python3 jobcarbon.py <jobid> --rapl rapl.tsv
+```
+
+Offline, from a saved record:
+
+```bash
+sacct -j <jobid> -P -o JobID,JobName,Partition,NodeList,AllocNodes,AllocCPUS,ElapsedRaw,TotalCPU,ReqMem,MaxRSS,State > job.sacct
+python3 jobcarbon.py --sacct-file job.sacct
+```
+
+## Output
+
+The baseline run of XSBench on one Aion node, as reported in the accompanying
+paper, is reproduced with:
 
 ```
 $ python3 jobcarbon.py --runtime 259.67 --energy-j 93135
@@ -68,45 +81,72 @@ run 'RUN' (median of 1): 259.67 s, CPU 93135 J measured
   i.e. 10.5 h of a 5 W LED, 65 m by petrol car
 ```
 
-With `--rapl`, runs are grouped by their marker label (`BASE1..n`, `OPT1..n`,
-`RUN1..n`); each group gives the median run, and if both `BASE` and `OPT` are
-present the saving per run is printed.
+For a job given by its identifier, the output also lists the allocation, the
+CPU efficiency, the reserved and peak memory, and any findings, each with the
+recommended change.
 
-## How the footprint is computed
+## Method
+
+**Energy.** Processor energy is taken, in order of preference, from a powercap
+recording, from a value measured by the user, or from the Green Algorithms
+model (cores × TDP per core × CPU usage). Memory and the rest of the node are
+always modelled:
 
 ```
-IT energy   = CPU energy + (memory W + rest-of-node W) x duration
-operational = IT energy x PUE x grid factor
-embodied    = node manufacturing x duration / (lifetime x utilisation)
+IT energy   = processor energy + (P_memory + P_rest) × duration
+operational = IT energy × PUE × grid factor
+embodied    = node manufacturing × duration / (lifetime × utilisation)
 ```
 
-CPU energy comes, in order of preference, from a powercap recording
-(`--rapl`), a value you measured (`--energy-j`), or the Green Algorithms model
-(cores x TDP per core x CPU usage). A job that holds part of a node is charged
-its share of cores. Default factors, for one regular Aion node:
+A job holding part of a node is charged its share of the cores.
+
+**NUMA finding.** A job that uses more cores than one NUMA domain provides can
+lose most of its memory bandwidth when its data is initialised by a single
+thread: the Linux first-touch policy then places every page in one domain. The
+check reads `numastat -p` inside the job's allocation; if one domain holds more
+than 60 % of the process memory, the tool recommends launching the program
+under `numactl --interleave=all`, or initialising the data in parallel with the
+threads that use it, and verifying the change by an identical output, a
+balanced `numastat`, and a new measurement of runtime and energy.
+
+**Memory finding.** Peak resident memory below half of the reservation is
+reported, with a suggested `--mem` value. On an exclusive node this frees
+resources only if exclusivity is also dropped.
+
+## Default factors
+
+The defaults describe a regular node of the Aion cluster (University of
+Luxembourg). For another system, provide the keys that differ in a JSON file
+passed with `--config`; the full set of keys is the `AION` dictionary in
+`jobcarbon.py`.
 
 | Factor | Value | Source |
 |---|---|---|
-| Memory power | 0.3725 W/GB x 256 GB | Lannelongue et al., Green Algorithms, 2021 |
-| Rest of node | 105.3 W | Green500 node power minus CPU TDP and memory (paper III.C) |
-| PUE | 1.3 (declared, range 1.10–1.67) | none published for Aion; see paper III.C |
-| Grid | 337 gCO2e/kWh | ecoinvent v3.11 cut-off, electricity low voltage, LU, IPCC 2021 GWP100 |
-| Node manufacturing | 960.7 kgCO2e | Dell PowerEdge R6525 LCA, adapted (paper Table A2) |
+| Processors | 2 × AMD EPYC 7H12, 280 W TDP, 128 cores | ULHPC documentation |
+| Memory power | 0.3725 W/GB × 256 GB | Lannelongue et al., *Green Algorithms*, Adv. Sci. 2021 |
+| Rest of node | 105.3 W | Green500 node power minus processor TDP and memory |
+| PUE | 1.3 (plausible range 1.10–1.67) | declared; not published for Aion |
+| Grid factor | 337 gCO2e/kWh | ecoinvent v3.11 cut-off, electricity, low voltage, LU, IPCC 2021 GWP100 |
+| Node manufacturing | 960.7 kgCO2e | Dell PowerEdge R6525 LCA, adapted to the Aion node |
 | Lifetime, utilisation | 8 years, 81.56 % | assumption; ULHPC workload analysis |
 
-For another machine, write a JSON file with the keys of `AION` in
-`jobcarbon.py` that differ, and pass it with `--config`.
+## Powercap recording format
 
-## Limits
+`--rapl` expects a whitespace-separated text file: a header line
+`# kind label unix_time <zone>:<name>:max=<wrap> ...`, then one line per
+reading, `SAMPLE - <time> <µJ per zone>` for periodic samples and
+`MARK <LABEL>_START|<LABEL>_END <time> <µJ per zone>` around each run. Runs are
+grouped by label without its trailing number (e.g. `BASE1..5`, `OPT1..5`); the
+median of each group is reported, and the saving per run when both `BASE` and
+`OPT` are present. A job script producing this format is part of the
+accompanying study.
 
-- The memory and rest-of-node power are modelled, not measured.
-- The whole-job estimate without `--rapl` uses TDP and overestimates
-  memory-bound jobs (by about 50 % on CPU energy for XSBench on Aion).
-- The NUMA check needs the job to be running; afterwards, placement cannot be
-  read back from Slurm.
-- The flags say where waste is likely; step 3 of the method is what proves a
-  change helped.
+## Limitations
 
-## Licence
+- Memory and rest-of-node power are modelled, not measured.
+- Without a powercap recording, the TDP-based estimate overestimates
+  memory-bound jobs (by about 50 % on processor energy for XSBench on Aion).
+- NUMA placement can only be observed while the job runs.
+- Findings indicate likely waste; only a new measurement shows that a change
+  reduced the footprint.
 
-MIT, see `LICENSE`.
